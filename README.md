@@ -1,6 +1,6 @@
 # スパークキャプチャ 0.1（試作）
 
-[Android用APKをダウンロード](https://github.com/mo201602-max/spark-capture/releases/download/v0.1/sparkcapture-0.1.apk) · [リリース一覧](https://github.com/mo201602-max/spark-capture/releases)
+[Android用APKをダウンロード](https://github.com/mo201602-max/spark-capture/raw/refs/heads/main/downloads/sparkcapture-0.1.apk) · [リリース一覧](https://github.com/mo201602-max/spark-capture/releases)
 
 インパルス試験の放電箇所を確認するためのAndroid用カメラアプリ。
 Android 8.0以降、背面カメラを想定。特定メーカーの独自機能や通信は不要です。
