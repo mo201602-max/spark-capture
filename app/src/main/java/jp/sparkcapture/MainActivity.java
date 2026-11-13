@@ -6,6 +6,7 @@ import android.os.*;
 import android.content.*;
 import android.content.pm.PackageManager;
 import android.graphics.*;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.camera2.*;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.*;
@@ -31,7 +32,21 @@ public class MainActivity extends Activity {
     CameraDevice camera; CameraCaptureSession session; ImageReader reader;
     ImageView preview; TextView status, detail; Button trigger, resume, export, previous, next, shareLast; Spinner rate;
     SeekBar scrub;
-    LinearLayout steps;
+    LinearLayout steps, playbackRow;
+    Button clipSave, clipOpen, clipShare, play;
+    Uri lastClip;
+    Spinner speed;
+    CheckBox bounce;
+    boolean playing, clipDirty;
+    int direction=1;
+    final Runnable playbackTick=new Runnable(){public void run(){
+        if(!playing || !active || saving || captured.size()<2){stopPlayback();return;}
+        if(!bounce.isChecked())direction=1;
+        int from=selectedIndex;
+        int to=Playback.next(from,captured.size(),direction,bounce.isChecked());
+        if(bounce.isChecked()){if(from==captured.size()-1)direction=-1;else if(from==0)direction=1;}
+        selectFrame(to);queuePlayback();
+    }};
     Uri pendingShare;
     int pendingIndex;
     volatile boolean armed = false, active = false;
@@ -46,8 +61,10 @@ public class MainActivity extends Activity {
     Range<Integer>[] ranges;
     boolean continuousFocus;
     static class Frame {
-        final byte[] y; final long time, sensor;
-        Frame(byte[] y, long time, long sensor) { this.y=y; this.time=time; this.sensor=sensor; }
+        final byte[] y; final long time, sensor; final int width,height,rotation;
+        Frame(byte[] y,long time,long sensor,int width,int height,int rotation){
+            this.y=y;this.time=time;this.sensor=sensor;this.width=width;this.height=height;this.rotation=rotation;
+        }
     }
     public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -55,10 +72,16 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this); root.setOrientation(1); root.setPadding(20,16,20,16);
         root.setBackgroundColor(Color.rgb(15,23,35));
         TextView title = label("スパークキャプチャ", 24); root.addView(title);
-        root.addView(label("直前1秒から1枚を選択 → 保存・共有",14));
+        LinearLayout clipActions=new LinearLayout(this);
+        clipOpen=new Button(this);clipOpen.setText("開く");clipSave=new Button(this);clipSave.setText("クリップ保存");clipSave.setEnabled(false);
+        clipShare=new Button(this);clipShare.setText("↗");clipShare.setContentDescription("クリップを共有");clipShare.setEnabled(false);
+        clipActions.addView(clipOpen,new LinearLayout.LayoutParams(0,-2,1));clipActions.addView(clipSave,new LinearLayout.LayoutParams(0,-2,1));clipActions.addView(clipShare,new LinearLayout.LayoutParams(dp(52),-2));root.addView(clipActions);
+        clipOpen.setOnClickListener(v->openClip());clipSave.setOnClickListener(v->saveClip());
+        String oldClip=getPreferences(MODE_PRIVATE).getString("lastClip",null);if(oldClip!=null){lastClip=Uri.parse(oldClip);clipShare.setEnabled(true);}
+        clipShare.setOnClickListener(v->{if(lastClip!=null)shareFile(lastClip,"application/octet-stream","クリップを共有");});
         preview = new ImageView(this); preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
         root.addView(preview,new LinearLayout.LayoutParams(-1,0,1));
-        status=label("カメラを準備中",18); root.addView(status);
+        status=label("準備中",16); root.addView(status);
         detail=label("",13); root.addView(detail);
         rate = new Spinner(this);
         rate.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"15 fps","30 fps","60 fps"}));
@@ -73,25 +96,32 @@ public class MainActivity extends Activity {
         scrub=new SeekBar(this); scrub.setEnabled(false); root.addView(scrub);
         scrub.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
             public void onProgressChanged(SeekBar s,int p,boolean from){if(from)showFrame(p);}
-            public void onStartTrackingTouch(SeekBar s){} public void onStopTrackingTouch(SeekBar s){}
+            public void onStartTrackingTouch(SeekBar s){stopPlayback();} public void onStopTrackingTouch(SeekBar s){}
         });
         steps=new LinearLayout(this);
-        previous=new Button(this);previous.setText("◀ 前のコマ");previous.setEnabled(false);
-        next=new Button(this);next.setText("次のコマ ▶");next.setEnabled(false);
+        previous=new Button(this);previous.setText("◀");previous.setEnabled(false);
+        next=new Button(this);next.setText("▶");next.setEnabled(false);
         steps.addView(previous,new LinearLayout.LayoutParams(0,-2,1));steps.addView(next,new LinearLayout.LayoutParams(0,-2,1));root.addView(steps);
-        previous.setOnClickListener(v->selectFrame(selectedIndex-1));next.setOnClickListener(v->selectFrame(selectedIndex+1));
-        trigger = new Button(this); trigger.setText("撮影 · 直前1秒を確定"); trigger.setTextSize(24);
-        trigger.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(25,110,185)));
-        trigger.setTextColor(Color.WHITE);trigger.setEnabled(false);
-        root.addView(trigger,new LinearLayout.LayoutParams(-1,(int)(96*getResources().getDisplayMetrics().density)));
+        previous.setContentDescription("前のコマ");next.setContentDescription("次のコマ");
+        previous.setOnClickListener(v->{stopPlayback();selectFrame(selectedIndex-1);});next.setOnClickListener(v->{stopPlayback();selectFrame(selectedIndex+1);});
+        playbackRow=new LinearLayout(this);
+        play=new Button(this);play.setText("再生");play.setOnClickListener(v->{if(playing)stopPlayback();else startPlayback();});
+        bounce=new CheckBox(this);bounce.setText("往復");bounce.setTextColor(Color.WHITE);
+        speed=new Spinner(this);speed.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"0.25×","0.5×","1×","2×"}));speed.setSelection(2);
+        playbackRow.addView(play,new LinearLayout.LayoutParams(0,-2,1));playbackRow.addView(bounce);playbackRow.addView(speed,new LinearLayout.LayoutParams(0,-2,1));root.addView(playbackRow);
+        trigger = new Button(this);trigger.setText("");trigger.setContentDescription("シャッター");
+        GradientDrawable shutter=new GradientDrawable();shutter.setShape(GradientDrawable.OVAL);shutter.setColor(Color.WHITE);shutter.setStroke(dp(6),Color.rgb(65,145,225));
+        trigger.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x6656aaff),shutter,null));trigger.setBackgroundTintList(null);trigger.setEnabled(false);trigger.setAlpha(0.35f);
+        LinearLayout.LayoutParams shutterLayout=new LinearLayout.LayoutParams(dp(88),dp(88));shutterLayout.gravity=Gravity.CENTER_HORIZONTAL;shutterLayout.topMargin=dp(8);shutterLayout.bottomMargin=dp(8);
+        root.addView(trigger,shutterLayout);
         trigger.setOnClickListener(v->capture());
-        export=new Button(this);export.setText("この1枚を保存して共有");export.setTextSize(18);export.setEnabled(false);root.addView(export);
+        export=new Button(this);export.setText("1枚を保存・共有");export.setTextSize(18);export.setEnabled(false);root.addView(export);
         export.setOnClickListener(v->saveSelected());
         LinearLayout row=new LinearLayout(this);
-        resume=new Button(this);resume.setText("撮影を再開");resume.setEnabled(false);row.addView(resume,new LinearLayout.LayoutParams(0,-2,1));
-        shareLast=new Button(this);shareLast.setText("保存した写真を共有");shareLast.setEnabled(false);row.addView(shareLast,new LinearLayout.LayoutParams(0,-2,1));root.addView(row);
+        resume=new Button(this);resume.setText("カメラへ");resume.setEnabled(false);row.addView(resume,new LinearLayout.LayoutParams(0,-2,1));
+        shareLast=new Button(this);shareLast.setText("写真を共有");shareLast.setEnabled(false);row.addView(shareLast,new LinearLayout.LayoutParams(0,-2,1));root.addView(row);
         resume.setOnClickListener(v->{
-            if(!captured.isEmpty())new AlertDialog.Builder(this).setTitle("残りのコマを破棄しますか？").setMessage("保存済みの写真は残ります。未保存のコマを破棄して撮影を再開します。")
+            if(!captured.isEmpty() && clipDirty)new AlertDialog.Builder(this).setTitle("コマを破棄しますか？")
                 .setPositiveButton("破棄して再開",(d,w)->restartCapture()).setNegativeButton("戻る",null).show();
             else restartCapture();
         });
@@ -109,8 +139,9 @@ public class MainActivity extends Activity {
         root.setOnApplyWindowInsetsListener((view,insets)->{view.setPadding(20+insets.getSystemWindowInsetLeft(),16+insets.getSystemWindowInsetTop(),20+insets.getSystemWindowInsetRight(),16+insets.getSystemWindowInsetBottom());return insets;});
         setContentView(root);updateMode();
     }
+    int dp(int n){return (int)(n*getResources().getDisplayMetrics().density+0.5f);}
     TextView label(String s,int size){TextView t=new TextView(this);t.setText(s);t.setTextSize(size);t.setTextColor(Color.WHITE);return t;}
-    protected void onResume(){super.onResume();active=true;if(remoteSession!=null)remoteSession.setActive(true);if(checkSelfPermission(Manifest.permission.CAMERA)==PackageManager.PERMISSION_GRANTED)startCamera();else requestPermissions(new String[]{Manifest.permission.CAMERA},1);ui.post(()->completeSavedPhoto());}
+    protected void onResume(){super.onResume();active=true;if(remoteSession!=null)remoteSession.setActive(true);if(!reviewing && !saving){if(checkSelfPermission(Manifest.permission.CAMERA)==PackageManager.PERMISSION_GRANTED)startCamera();else requestPermissions(new String[]{Manifest.permission.CAMERA},1);}ui.post(()->completeSavedPhoto());}
     public void onRequestPermissionsResult(int r,String[] p,int[] g){
         super.onRequestPermissionsResult(r,p,g);
         if(r==2){if(g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)saveSelected();else status.setText("写真の保存にはストレージの許可が必要です。コマは保持しています。");return;}
@@ -118,7 +149,7 @@ public class MainActivity extends Activity {
         else if(r==1)status.setText("カメラの許可が必要です。設定から許可してください。");
     }
     void startCamera(){
-        if(thread!=null || !active)return;
+        if(thread!=null || !active || reviewing || saving)return;
         thread=new HandlerThread("Camera");thread.start();cameraHandler=new Handler(thread.getLooper());
         cameraHandler.post(()->{
             try{
@@ -151,7 +182,7 @@ public class MainActivity extends Activity {
     }
     void createSession(){try{
         camera.createCaptureSession(Collections.singletonList(reader.getSurface()),new CameraCaptureSession.StateCallback(){
-            public void onConfigured(CameraCaptureSession s){if(!active){s.close();return;}session=s;synchronized(lock){ring.clear();firstFrame=0;armed=!reviewing;}configureRequest();}
+            public void onConfigured(CameraCaptureSession s){if(!active){s.close();return;}session=s;synchronized(lock){ring.clear();firstFrame=0;armed=!reviewing && !saving;}configureRequest();}
             public void onConfigureFailed(CameraCaptureSession s){fail("このカメラの撮影設定に対応していません");}
         },cameraHandler);
     }catch(Exception e){fail(e.getMessage());}}
@@ -178,7 +209,7 @@ public class MainActivity extends Activity {
             Image.Plane plane=img.getPlanes()[0];ByteBuffer buf=plane.getBuffer();int base=buf.position();
             byte[] y=new byte[width*height];
             for(int row=0;row<height;row++)for(int col=0;col<width;col++)y[row*width+col]=buf.get(base+row*plane.getRowStride()+col*plane.getPixelStride());
-            Frame f=new Frame(y,now,img.getTimestamp());
+            Frame f=new Frame(y,now,img.getTimestamp(),width,height,rotation);
             boolean ready; int count; long span;
             synchronized(lock){
                 if(!armed)return;
@@ -189,29 +220,31 @@ public class MainActivity extends Activity {
             if(now-lastPreview>150_000_000L){
                 lastPreview=now;Bitmap bitmap=bitmap(f);
                 final boolean ok=ready;final int n=count;final long duration=span;
-                ui.post(()->{if(!armed || !active)return;preview.setImageBitmap(bitmap);trigger.setEnabled(ok);status.setText(ok?"待機中 · 音がしたら撮影":"直前1秒を準備中…");detail.setText(String.format(Locale.JAPAN,"%d × %d · 実測 %.1f fps · %dコマ",width,height,duration>0?(n-1)*1e9/duration:0,n));});
+                ui.post(()->{if(!armed || !active)return;preview.setImageBitmap(bitmap);trigger.setEnabled(ok);trigger.setAlpha(ok?1f:0.35f);status.setText(ok?"撮影できます":"準備中");detail.setText(String.format(Locale.JAPAN,"%d × %d · %.1f fps · %dコマ",width,height,duration>0?(n-1)*1e9/duration:0,n));});
             }
         }catch(Exception e){fail("画像取得エラー: "+e.getMessage());}
     }
     Bitmap bitmap(Frame f){
         int[] pixels=new int[f.y.length];for(int i=0;i<pixels.length;i++){int y=f.y[i]&255;pixels[i]=0xff000000|(y<<16)|(y<<8)|y;}
-        Bitmap raw=Bitmap.createBitmap(pixels,width,height,Bitmap.Config.ARGB_8888);
-        Matrix m=new Matrix();m.postRotate(rotation);Bitmap result=Bitmap.createBitmap(raw,0,0,width,height,m,true);if(result!=raw)raw.recycle();return result;
+        Bitmap raw=Bitmap.createBitmap(pixels,f.width,f.height,Bitmap.Config.ARGB_8888);
+        Matrix m=new Matrix();m.postRotate(f.rotation);Bitmap result=Bitmap.createBitmap(raw,0,0,f.width,f.height,m,true);if(result!=raw)raw.recycle();return result;
     }
     void capture(){
         if(!active || !armed || !trigger.isEnabled() || reviewing || saving)return;
         pressed=SystemClock.elapsedRealtimeNanos();
         synchronized(lock){armed=false;captured=new ArrayList<>();for(Frame f:ring)if(f.time<=pressed&&pressed-f.time<=1_000_000_000L)captured.add(f);ring.clear();}
-        reviewing=true;trigger.setEnabled(false);rate.setEnabled(false);resume.setEnabled(true);updateMode();
+        reviewing=true;clipDirty=true;trigger.setEnabled(false);rate.setEnabled(false);resume.setEnabled(true);updateMode();
         if(captured.isEmpty()){status.setText("対象のコマがありません。撮影を再開してください。");return;}
         setReviewEnabled(true);selectFrame(captured.size()-1);
-        status.setText("コマを選び「この1枚を保存して共有」を押してください");
+        status.setText("コマを選択");
     }
     void updateMode(){
         boolean selecting=reviewing && !captured.isEmpty();
         scrub.setVisibility(selecting?View.VISIBLE:View.GONE);steps.setVisibility(selecting?View.VISIBLE:View.GONE);
         export.setVisibility(selecting?View.VISIBLE:View.GONE);trigger.setVisibility(reviewing?View.GONE:View.VISIBLE);
         rate.setVisibility(reviewing?View.GONE:View.VISIBLE);
+        playbackRow.setVisibility(selecting?View.VISIBLE:View.GONE);
+        clipSave.setEnabled(selecting && !saving);clipOpen.setEnabled(!saving);clipShare.setEnabled(lastClip!=null && !saving);play.setEnabled(selecting && !saving && captured.size()>1);
     }
     void setReviewEnabled(boolean enabled){
         scrub.setEnabled(enabled);export.setEnabled(enabled);previous.setEnabled(enabled);next.setEnabled(enabled);
@@ -225,20 +258,21 @@ public class MainActivity extends Activity {
         if(saving || i<0||i>=captured.size())return;
         selectedIndex=i;Frame f=captured.get(i);preview.setImageBitmap(bitmap(f));
         previous.setEnabled(i>0);next.setEnabled(i+1<captured.size());
-        detail.setText(String.format(Locale.JAPAN,"%d / %d コマ · ボタンの %.0f ms前",i+1,captured.size(),(pressed-f.time)/1e6));
+        detail.setText(String.format(Locale.JAPAN,"%d / %d · %.0f ms前",i+1,captured.size(),(pressed-f.time)/1e6));
     }
     void restartCapture(){
-        captured.clear();reviewing=false;setReviewEnabled(false);resume.setEnabled(false);rate.setEnabled(true);
+        stopPlayback();captured.clear();clipDirty=false;reviewing=false;setReviewEnabled(false);resume.setEnabled(false);rate.setEnabled(true);
         synchronized(lock){ring.clear();firstFrame=0;armed=active;}
-        status.setText("直前1秒を準備中…");updateMode();
+        status.setText("準備中");updateMode();if(checkSelfPermission(Manifest.permission.CAMERA)==PackageManager.PERMISSION_GRANTED)startCamera();else requestPermissions(new String[]{Manifest.permission.CAMERA},1);
     }
     void saveSelected(){
         if(saving || captured.isEmpty() || !reviewing)return;
         if(Build.VERSION.SDK_INT<=28 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)!=PackageManager.PERMISSION_GRANTED){
             requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},2);return;
         }
+        stopPlayback();
         final Frame selected=captured.get(selectedIndex);final int index=selectedIndex;
-        saving=true;setReviewEnabled(false);resume.setEnabled(false);shareLast.setEnabled(false);status.setText("選択した1枚を保存中…");
+        saving=true;setReviewEnabled(false);resume.setEnabled(false);shareLast.setEnabled(false);status.setText("保存中…");updateMode();
         files.execute(()->{
             Uri uri=null;Bitmap bm=null;
             try{
@@ -261,13 +295,13 @@ public class MainActivity extends Activity {
                 ui.post(()->{
                     saving=false;lastSaved=saved;getPreferences(MODE_PRIVATE).edit().putString("lastPhoto",saved.toString()).apply();
                     if(isDestroyed())return;
-                    captured.remove(index);resume.setEnabled(true);shareLast.setEnabled(true);
-                    status.setText("1枚をPictures/SparkCaptureに保存しました");
+                    // Keep the full sequence until the user chooses to discard it.resume.setEnabled(true);shareLast.setEnabled(true);
+                    status.setText("保存しました");
                     pendingShare=saved;pendingIndex=index;updateMode();completeSavedPhoto();
                 });
             }catch(Exception e){
                 if(uri!=null)try{getContentResolver().delete(uri,null,null);}catch(Exception ignored){}
-                ui.post(()->{saving=false;setReviewEnabled(true);selectFrame(index);resume.setEnabled(true);shareLast.setEnabled(lastSaved!=null);status.setText("保存失敗: "+e.getMessage()+"（コマは保持しています）");});
+                ui.post(()->{saving=false;setReviewEnabled(true);selectFrame(index);resume.setEnabled(true);shareLast.setEnabled(lastSaved!=null);status.setText("保存失敗: "+e.getMessage());updateMode();});
             }finally{if(bm!=null)bm.recycle();}
         });
     }
@@ -276,18 +310,91 @@ public class MainActivity extends Activity {
         final Uri saved=pendingShare;final int index=pendingIndex;pendingShare=null;
         if(captured.isEmpty()){detail.setText("すべての選択が完了しました");sharePhoto(saved);return;}
         new AlertDialog.Builder(this).setTitle("1枚を保存しました")
-            .setMessage("残りのコマから追加で保存しますか？ 選んだあとに共有メニューを開きます。")
+
             .setPositiveButton("追加で選ぶ",(d,w)->{setReviewEnabled(true);selectFrame(Math.min(index,captured.size()-1));sharePhoto(saved);})
-            .setNegativeButton("残りを破棄",(d,w)->{captured.clear();setReviewEnabled(false);updateMode();detail.setText("保存した1枚を残し、他のコマを破棄しました");sharePhoto(saved);})
+            .setNegativeButton("残りを破棄",(d,w)->{stopPlayback();captured.clear();clipDirty=false;setReviewEnabled(false);updateMode();detail.setText("");sharePhoto(saved);})
             .setCancelable(false).show();
     }
-    void sharePhoto(Uri uri){
+    void sharePhoto(Uri uri){shareFile(uri,"image/jpeg","写真を共有");}
+    void shareFile(Uri uri,String mime,String title){
         if(uri==null)return;
-        Intent send=new Intent(Intent.ACTION_SEND);send.setType("image/jpeg");send.putExtra(Intent.EXTRA_STREAM,uri);
+        Intent send=new Intent(Intent.ACTION_SEND);send.setType(mime);send.putExtra(Intent.EXTRA_STREAM,uri);
         send.setClipData(ClipData.newRawUri("撮影した写真",uri));send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        try{startActivity(Intent.createChooser(send,"写真を共有・メールに添付"));}
-        catch(ActivityNotFoundException e){status.setText("共有先のアプリがありません。写真は保存済みです。");}
-        catch(SecurityException e){status.setText("写真を共有できません。ギャラリーから共有してください。");}
+        try{startActivity(Intent.createChooser(send,title));}
+        catch(ActivityNotFoundException e){status.setText("共有先のアプリがありません。");}
+        catch(SecurityException e){status.setText("共有できません。保存先から共有してください。");}
+    }
+    void startPlayback(){
+        if(captured.size()<2 || saving)return;
+        direction=bounce.isChecked() && selectedIndex==captured.size()-1?-1:1;
+        if(!bounce.isChecked() && selectedIndex==captured.size()-1)selectFrame(0);
+        playing=true;play.setText("停止");queuePlayback();
+    }
+    void queuePlayback(){
+        if(!playing || captured.size()<2)return;
+        if(!bounce.isChecked())direction=1;
+        int from=selectedIndex,to=Playback.next(from,captured.size(),direction,bounce.isChecked());
+        if(!bounce.isChecked() && from==captured.size()-1 && to==0){from=0;to=1;}
+        long delay=Playback.delay(captured.get(from).time,captured.get(to).time,new double[]{0.25,0.5,1,2}[speed.getSelectedItemPosition()]);
+        ui.postDelayed(playbackTick,delay);
+    }
+    void stopPlayback(){playing=false;ui.removeCallbacks(playbackTick);if(play!=null)play.setText("再生");}
+    void saveClip(){
+        if(captured.isEmpty() || saving)return;stopPlayback();
+        Intent intent=new Intent(Intent.ACTION_CREATE_DOCUMENT);intent.setType("application/octet-stream");intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.putExtra(Intent.EXTRA_TITLE,"clip-"+new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",Locale.US).format(new Date())+".sparkclip");
+        startActivityForResult(intent,20);
+    }
+    void openClip(){
+        if(saving)return;stopPlayback();
+        if(clipDirty && !captured.isEmpty())new AlertDialog.Builder(this).setTitle("今のコマを破棄して開きますか？")
+            .setPositiveButton("開く",(d,w)->chooseClip()).setNegativeButton("戻る",null).show();
+        else chooseClip();
+    }
+    void chooseClip(){
+        Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.setType("*/*");intent.addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(intent,21);
+    }
+    protected void onActivityResult(int request,int result,Intent data){
+        super.onActivityResult(request,result,data);
+        if(result!=RESULT_OK || data==null || data.getData()==null)return;
+        if(request!=20 && request!=21)return;
+        int grants=data.getFlags()&(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        if(grants!=0)try{getContentResolver().takePersistableUriPermission(data.getData(),grants);}catch(SecurityException ignored){}
+        if(request==20)writeClip(data.getData());else readClip(data.getData());
+    }
+    void rememberClip(Uri uri){lastClip=uri;getPreferences(MODE_PRIVATE).edit().putString("lastClip",uri.toString()).apply();}
+    void setBusy(boolean busy){
+        saving=busy;setReviewEnabled(!busy && !captured.isEmpty());resume.setEnabled(!busy && reviewing);
+        shareLast.setEnabled(!busy && lastSaved!=null);updateMode();
+    }
+    void writeClip(Uri destination){
+        final ArrayList<Frame> frames=new ArrayList<>(captured);final long triggerTime=pressed;
+        if(frames.isEmpty())return;setBusy(true);status.setText("保存中…");
+        files.execute(()->{
+            try{
+                long[] times=new long[frames.size()];for(int i=0;i<times.length;i++)times[i]=frames.get(i).time-triggerTime;
+                try(OutputStream out=getContentResolver().openOutputStream(destination,"wt")){if(out==null)throw new IOException("保存先を開けません");
+                ClipArchive.write(out,times,i->{Bitmap bm=bitmap(frames.get(i));try{ByteArrayOutputStream bytes=new ByteArrayOutputStream();if(!bm.compress(Bitmap.CompressFormat.PNG,100,bytes))throw new IOException("画像の保存失敗");return bytes.toByteArray();}finally{bm.recycle();}});}
+                ui.post(()->{if(isDestroyed())return;clipDirty=false;rememberClip(destination);setBusy(false);status.setText("クリップを保存しました");});
+            }catch(Exception e){ui.post(()->{if(isDestroyed())return;setBusy(false);status.setText("保存失敗: "+e.getMessage());});}
+        });
+    }
+    void readClip(Uri source){
+        setBusy(true);synchronized(lock){armed=false;ring.clear();}trigger.setEnabled(false);status.setText("読み込み中…");
+        files.execute(()->{
+            try{
+                ArrayList<Frame> loaded=new ArrayList<>();final long[] pixels={0};
+                try(InputStream in=getContentResolver().openInputStream(source)){if(in==null)throw new IOException("ファイルを開けません");
+                ClipArchive.read(in,(png,time)->{
+                    BitmapFactory.Options bounds=new BitmapFactory.Options();bounds.inJustDecodeBounds=true;BitmapFactory.decodeByteArray(png,0,png.length,bounds);
+                    long count=(long)bounds.outWidth*bounds.outHeight;pixels[0]+=count;
+                    if(bounds.outWidth<1 || bounds.outHeight<1 || count>2_000_000 || pixels[0]>40_000_000)throw new IOException("画像サイズが範囲外です");
+                    Bitmap bm=BitmapFactory.decodeByteArray(png,0,png.length);if(bm==null)throw new IOException("画像が破損しています");
+                    try{int w=bm.getWidth(),h=bm.getHeight();int[] rgb=new int[w*h];bm.getPixels(rgb,0,w,0,0,w,h);byte[] y=new byte[rgb.length];for(int j=0;j<rgb.length;j++)y[j]=(byte)(rgb[j]&255);loaded.add(new Frame(y,time,0,w,h,0));}finally{bm.recycle();}
+                });}
+                ui.post(()->{if(isDestroyed())return;captured=loaded;pressed=0;reviewing=true;clipDirty=false;rememberClip(source);setBusy(false);selectFrame(0);status.setText("クリップ");});
+            }catch(Exception e){ui.post(()->{if(isDestroyed())return;setBusy(false);if(!reviewing){synchronized(lock){firstFrame=0;armed=active;}startCamera();}status.setText("読み込み失敗: "+e.getMessage());});}
+        });
     }
     boolean handleShutter(KeyEvent event){
         int code=event.getKeyCode();
@@ -301,7 +408,7 @@ public class MainActivity extends Activity {
     protected void onDestroy(){if(remoteSession!=null)remoteSession.release();files.shutdown();super.onDestroy();}
     void fail(String message){synchronized(lock){armed=false;}ui.post(()->{status.setText(message);trigger.setEnabled(false);});}
     protected void onPause(){
-        active=false;if(remoteSession!=null)remoteSession.setActive(false);synchronized(lock){armed=false;ring.clear();}trigger.setEnabled(false);
+        stopPlayback();active=false;if(remoteSession!=null)remoteSession.setActive(false);synchronized(lock){armed=false;ring.clear();}trigger.setEnabled(false);
         if(cameraHandler!=null){HandlerThread old=thread;cameraHandler.post(()->{if(session!=null){session.close();session=null;}if(camera!=null){camera.close();camera=null;}if(reader!=null){reader.close();reader=null;}old.quitSafely();});try{old.join(2000);}catch(InterruptedException e){Thread.currentThread().interrupt();}thread=null;cameraHandler=null;}
         super.onPause();
     }
