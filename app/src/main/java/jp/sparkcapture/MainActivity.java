@@ -30,21 +30,19 @@ public class MainActivity extends Activity {
     final Handler ui = new Handler(Looper.getMainLooper());
     HandlerThread thread; Handler cameraHandler;
     CameraDevice camera; CameraCaptureSession session; ImageReader reader;
-    ImageView preview; TextView status, detail; Button trigger, resume, export, previous, next, shareLast; Spinner rate;
+    ImageView preview; TextView status, detail; Button trigger, resume, export, previous, next; Spinner rate;
     SeekBar scrub;
     LinearLayout steps, playbackRow;
     Button clipSave, clipOpen, clipShare, play;
     Uri lastClip;
     Spinner speed;
-    CheckBox bounce;
     boolean playing, clipDirty;
     int direction=1;
     final Runnable playbackTick=new Runnable(){public void run(){
         if(!playing || !active || saving || captured.size()<2){stopPlayback();return;}
-        if(!bounce.isChecked())direction=1;
         int from=selectedIndex;
-        int to=Playback.next(from,captured.size(),direction,bounce.isChecked());
-        if(bounce.isChecked()){if(from==captured.size()-1)direction=-1;else if(from==0)direction=1;}
+        int to=Playback.next(from,captured.size(),direction);
+        if(from==captured.size()-1)direction=-1;else if(from==0)direction=1;
         selectFrame(to);queuePlayback();
     }};
     Uri pendingShare;
@@ -71,7 +69,7 @@ public class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         LinearLayout root = new LinearLayout(this); root.setOrientation(1); root.setPadding(20,16,20,16);
         root.setBackgroundColor(Color.rgb(15,23,35));
-        TextView title = label("スパークキャプチャ", 24); root.addView(title);
+        TextView title = label("1秒前カメラ", 24); root.addView(title);
         LinearLayout clipActions=new LinearLayout(this);
         clipOpen=new Button(this);clipOpen.setText("開く");clipSave=new Button(this);clipSave.setText("クリップ保存");clipSave.setEnabled(false);
         clipShare=new Button(this);clipShare.setText("↗");clipShare.setContentDescription("クリップを共有");clipShare.setEnabled(false);
@@ -106,9 +104,8 @@ public class MainActivity extends Activity {
         previous.setOnClickListener(v->{stopPlayback();selectFrame(selectedIndex-1);});next.setOnClickListener(v->{stopPlayback();selectFrame(selectedIndex+1);});
         playbackRow=new LinearLayout(this);
         play=new Button(this);play.setText("再生");play.setOnClickListener(v->{if(playing)stopPlayback();else startPlayback();});
-        bounce=new CheckBox(this);bounce.setText("往復");bounce.setTextColor(Color.WHITE);
         speed=new Spinner(this);speed.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"0.25×","0.5×","1×","2×"}));speed.setSelection(2);
-        playbackRow.addView(play,new LinearLayout.LayoutParams(0,-2,1));playbackRow.addView(bounce);playbackRow.addView(speed,new LinearLayout.LayoutParams(0,-2,1));root.addView(playbackRow);
+        playbackRow.addView(play,new LinearLayout.LayoutParams(0,-2,1));playbackRow.addView(speed,new LinearLayout.LayoutParams(0,-2,1));root.addView(playbackRow);
         trigger = new Button(this);trigger.setText("");trigger.setContentDescription("シャッター");
         GradientDrawable shutter=new GradientDrawable();shutter.setShape(GradientDrawable.OVAL);shutter.setColor(Color.WHITE);shutter.setStroke(dp(6),Color.rgb(65,145,225));
         trigger.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x6656aaff),shutter,null));trigger.setBackgroundTintList(null);trigger.setEnabled(false);trigger.setAlpha(0.35f);
@@ -119,15 +116,12 @@ public class MainActivity extends Activity {
         export.setOnClickListener(v->saveSelected());
         LinearLayout row=new LinearLayout(this);
         resume=new Button(this);resume.setText("カメラへ");resume.setEnabled(false);row.addView(resume,new LinearLayout.LayoutParams(0,-2,1));
-        shareLast=new Button(this);shareLast.setText("写真を共有");shareLast.setEnabled(false);row.addView(shareLast,new LinearLayout.LayoutParams(0,-2,1));root.addView(row);
+        root.addView(row);
         resume.setOnClickListener(v->{
             if(!captured.isEmpty() && clipDirty)new AlertDialog.Builder(this).setTitle("コマを破棄しますか？")
                 .setPositiveButton("破棄して再開",(d,w)->restartCapture()).setNegativeButton("戻る",null).show();
             else restartCapture();
         });
-        String saved=getPreferences(MODE_PRIVATE).getString("lastPhoto",null);
-        if(saved!=null){lastSaved=Uri.parse(saved);shareLast.setEnabled(true);}
-        shareLast.setOnClickListener(v->sharePhoto(lastSaved));
         remoteSession=new MediaSession(this,"SparkCapture shutter");
         remoteSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS);
         remoteSession.setPlaybackState(new PlaybackState.Builder().setState(PlaybackState.STATE_PAUSED,0,0)
@@ -272,7 +266,7 @@ public class MainActivity extends Activity {
         }
         stopPlayback();
         final Frame selected=captured.get(selectedIndex);final int index=selectedIndex;
-        saving=true;setReviewEnabled(false);resume.setEnabled(false);shareLast.setEnabled(false);status.setText("保存中…");updateMode();
+        saving=true;setReviewEnabled(false);resume.setEnabled(false);status.setText("保存中…");updateMode();
         files.execute(()->{
             Uri uri=null;Bitmap bm=null;
             try{
@@ -295,13 +289,14 @@ public class MainActivity extends Activity {
                 ui.post(()->{
                     saving=false;lastSaved=saved;getPreferences(MODE_PRIVATE).edit().putString("lastPhoto",saved.toString()).apply();
                     if(isDestroyed())return;
-                    // Keep the full sequence until the user chooses to discard it.resume.setEnabled(true);shareLast.setEnabled(true);
+                    // Keep the sequence available for clip saving.
+                    resume.setEnabled(true);
                     status.setText("保存しました");
                     pendingShare=saved;pendingIndex=index;updateMode();completeSavedPhoto();
                 });
             }catch(Exception e){
                 if(uri!=null)try{getContentResolver().delete(uri,null,null);}catch(Exception ignored){}
-                ui.post(()->{saving=false;setReviewEnabled(true);selectFrame(index);resume.setEnabled(true);shareLast.setEnabled(lastSaved!=null);status.setText("保存失敗: "+e.getMessage());updateMode();});
+                ui.post(()->{saving=false;setReviewEnabled(true);selectFrame(index);resume.setEnabled(true);status.setText("保存失敗: "+e.getMessage());updateMode();});
             }finally{if(bm!=null)bm.recycle();}
         });
     }
@@ -326,15 +321,12 @@ public class MainActivity extends Activity {
     }
     void startPlayback(){
         if(captured.size()<2 || saving)return;
-        direction=bounce.isChecked() && selectedIndex==captured.size()-1?-1:1;
-        if(!bounce.isChecked() && selectedIndex==captured.size()-1)selectFrame(0);
+        direction=selectedIndex==captured.size()-1?-1:1;
         playing=true;play.setText("停止");queuePlayback();
     }
     void queuePlayback(){
         if(!playing || captured.size()<2)return;
-        if(!bounce.isChecked())direction=1;
-        int from=selectedIndex,to=Playback.next(from,captured.size(),direction,bounce.isChecked());
-        if(!bounce.isChecked() && from==captured.size()-1 && to==0){from=0;to=1;}
+        int from=selectedIndex,to=Playback.next(from,captured.size(),direction);
         long delay=Playback.delay(captured.get(from).time,captured.get(to).time,new double[]{0.25,0.5,1,2}[speed.getSelectedItemPosition()]);
         ui.postDelayed(playbackTick,delay);
     }
@@ -365,7 +357,7 @@ public class MainActivity extends Activity {
     void rememberClip(Uri uri){lastClip=uri;getPreferences(MODE_PRIVATE).edit().putString("lastClip",uri.toString()).apply();}
     void setBusy(boolean busy){
         saving=busy;setReviewEnabled(!busy && !captured.isEmpty());resume.setEnabled(!busy && reviewing);
-        shareLast.setEnabled(!busy && lastSaved!=null);updateMode();
+        updateMode();
     }
     void writeClip(Uri destination){
         final ArrayList<Frame> frames=new ArrayList<>(captured);final long triggerTime=pressed;
